@@ -6,6 +6,7 @@ import {
   findRepo,
   readObject,
   writeObject,
+  hashObject,
   parseTree,
   parseCommit,
   isAncestor,
@@ -101,6 +102,16 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
     }
   }
 
+  const haveObjects = new Set<string>();
+  for (const cSha of haveCommits) {
+    const obj = readObject(cSha);
+    if (!obj || obj.type !== 'commit') continue;
+    const c = parseCommit(obj.data);
+    if (c.tree) {
+      collectTreeAndBlobs(c.tree, haveObjects);
+    }
+  }
+
   const wantCommits = new Set<string>();
   const shallowShas = new Set<string>();
   const queue: { sha: string; depth: number }[] = wants.map((w) => ({ sha: w, depth: 0 }));
@@ -136,6 +147,10 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
     }
   }
 
+  for (const s of haveObjects) {
+    objectShas.delete(s);
+  }
+
   function collectTreeAndBlobs(treeSha: string, set: Set<string>) {
     if (set.has(treeSha)) return;
     set.add(treeSha);
@@ -143,11 +158,16 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
     if (!obj || obj.type !== 'tree') return;
     const entries = parseTree(obj.data);
     for (const entry of entries) {
-      set.add(entry.sha);
       if (entry.mode === '40000' || entry.mode === '040000' || entry.mode === '400') {
         collectTreeAndBlobs(entry.sha, set);
+      } else {
+        set.add(entry.sha);
       }
     }
+  }
+
+  for (const sha of [...objectShas]) {
+    if (!readObject(sha)) objectShas.delete(sha);
   }
 
   const packParts: Buffer[] = [];
@@ -434,7 +454,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         }
 
         if (wantUnborn && repo.refs.size === 0) {
-          outLines.push(pktLine(`${ZERO_OID} HEAD symref-target:refs/heads/main\n`));
+          outLines.push(pktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
         }
 
         outLines.push(PKT_FLUSH);
@@ -598,6 +618,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
 
     const packData = bodyBuf.subarray(offset);
     const unpackedObjects = new Map<string, { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer }>();
+    let unpackSuccess = true;
 
     if (packData.length > 12 && packData.toString('ascii', 0, 4) === 'PACK') {
       const objCount = packData.readUInt32BE(8);
@@ -627,16 +648,13 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
 
         if (typeNum === 6) {
           // OBJ_OFS_DELTA
-          let negOff = 0;
-          let shiftOff = 0;
-          while (packOffset < packData.length) {
-            const ob = packData[packOffset++];
-            negOff |= (ob & 0x7f) << shiftOff;
-            if (!(ob & 0x80)) break;
-            shiftOff += 7;
-            negOff += 1 << shiftOff;
+          let byte = packData[packOffset++];
+          let offset = byte & 0x7f;
+          while (byte & 0x80) {
+            byte = packData[packOffset++];
+            offset = ((offset + 1) << 7) | (byte & 0x7f);
           }
-          baseOffset = entryOffset - negOff;
+          baseOffset = entryOffset - offset;
         } else if (typeNum === 7) {
           // OBJ_REF_DELTA
           if (packOffset + 20 > packData.length) break;
@@ -658,6 +676,21 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         parsedEntries.push({ typeNum, data: rawData, baseSha, baseOffset, packOffset: entryOffset });
       }
 
+      // Build sha->entry map for non-delta entries in pack
+      const packShaMap = new Map<string, number>();
+      for (let i = 0; i < parsedEntries.length; i++) {
+        const entry = parsedEntries[i];
+        if (entry.typeNum !== 6 && entry.typeNum !== 7) {
+          let objType: 'blob' | 'tree' | 'commit' | 'tag' = 'blob';
+          if (entry.typeNum === 1) objType = 'commit';
+          else if (entry.typeNum === 2) objType = 'tree';
+          else if (entry.typeNum === 3) objType = 'blob';
+          else if (entry.typeNum === 4) objType = 'tag';
+          const sha = hashObject(objType, entry.data);
+          packShaMap.set(sha, i);
+        }
+      }
+
       // Resolve deltas and store objects
       const resolvedObjects = new Map<number, { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer; sha: string }>();
 
@@ -674,23 +707,47 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         else if (entry.typeNum === 4) objType = 'tag';
 
         if (entry.typeNum === 6 || entry.typeNum === 7) {
-          let baseData: Buffer;
+          let baseData: Buffer | undefined = undefined;
+          let baseType: 'blob' | 'tree' | 'commit' | 'tag' | undefined = undefined;
+
           if (entry.baseSha) {
             const baseObj = readObject(entry.baseSha);
-            baseData = baseObj ? baseObj.data : Buffer.alloc(0);
+            if (baseObj) {
+              baseData = baseObj.data;
+              baseType = baseObj.type;
+            } else if (packShaMap.has(entry.baseSha)) {
+              const baseRes = getResolved(packShaMap.get(entry.baseSha)!);
+              if (baseRes) {
+                baseData = baseRes.data;
+                baseType = baseRes.type;
+              }
+            } else {
+              for (const [, res] of resolvedObjects) {
+                if (res.sha === entry.baseSha) {
+                  baseData = res.data;
+                  baseType = res.type;
+                  break;
+                }
+              }
+            }
           } else if (entry.baseOffset !== undefined) {
             const baseIdx = parsedEntries.findIndex((e) => e.packOffset === entry.baseOffset);
             if (baseIdx !== -1) {
               const baseRes = getResolved(baseIdx);
-              baseData = baseRes ? baseRes.data : Buffer.alloc(0);
-            } else {
-              baseData = Buffer.alloc(0);
+              if (baseRes) {
+                baseData = baseRes.data;
+                baseType = baseRes.type;
+              }
             }
-          } else {
-            baseData = Buffer.alloc(0);
           }
+
+          if (!baseData || !baseType) {
+            unpackSuccess = false;
+            return null;
+          }
+
+          objType = baseType;
           const targetData = applyDelta(baseData, entry.data);
-          // Determine base object type for delta if needed, or default commit/tree/blob
           const sha = writeObject(objType, targetData);
           const res = { type: objType, data: targetData, sha };
           resolvedObjects.set(idx, res);
@@ -708,66 +765,73 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
       }
     }
 
-    // Validate and apply ref updates
-    const refResults: { refname: string; ok: boolean; reason?: string }[] = [];
-
-    for (const cmd of commands) {
-      const { oldSha, newSha, refname } = cmd;
-      const isCreate = oldSha === ZERO_OID;
-      const isDelete = newSha === ZERO_OID;
-
-      if (isDelete) {
-        if (!repo.refs.has(refname)) {
-          refResults.push({ refname, ok: false, reason: 'no such ref' });
-        } else {
-          repo.refs.delete(refname);
-          refResults.push({ refname, ok: true });
-        }
-        continue;
-      }
-
-      const newObj = readObject(newSha);
-      if (!newObj) {
-        refResults.push({ refname, ok: false, reason: 'missing object' });
-        continue;
-      }
-
-      if (isCreate) {
-        if (repo.refs.has(refname) && repo.refs.get(refname) !== ZERO_OID) {
-          refResults.push({ refname, ok: false, reason: 'already exists' });
-        } else if (refname.startsWith('refs/heads/') && newObj.type !== 'commit') {
-          refResults.push({ refname, ok: false, reason: 'not a commit' });
-        } else {
-          repo.refs.set(refname, newSha);
-          if (refname === `refs/heads/${repo.defaultBranch}` || repo.refs.size === 1) {
-            repo.defaultBranch = refname.startsWith('refs/heads/') ? refname.substring(11) : repo.defaultBranch;
-          }
-          refResults.push({ refname, ok: true });
-        }
-      } else {
-        // Update
-        const currentSha = repo.refs.get(refname);
-        if (currentSha !== oldSha) {
-          refResults.push({ refname, ok: false, reason: 'stale ref' });
-        } else if (newObj.type !== 'commit') {
-          refResults.push({ refname, ok: false, reason: 'not a commit' });
-        } else if (!isAncestor(oldSha, newSha)) {
-          refResults.push({ refname, ok: false, reason: 'non-fast-forward' });
-        } else {
-          repo.refs.set(refname, newSha);
-          refResults.push({ refname, ok: true });
-        }
-      }
-    }
-
-    // Build report-status response
     const reportLines: Buffer[] = [];
-    reportLines.push(pktLine('unpack ok\n'));
-    for (const r of refResults) {
-      if (r.ok) {
-        reportLines.push(pktLine(`ok ${r.refname}\n`));
-      } else {
-        reportLines.push(pktLine(`ng ${r.refname} ${r.reason ?? 'failed'}\n`));
+    if (!unpackSuccess) {
+      reportLines.push(pktLine('unpack error unresolvable delta base\n'));
+      for (const cmd of commands) {
+        reportLines.push(pktLine(`ng ${cmd.refname} unpack failed\n`));
+      }
+    } else {
+      // Validate and apply ref updates
+      const refResults: { refname: string; ok: boolean; reason?: string }[] = [];
+
+      for (const cmd of commands) {
+        const { oldSha, newSha, refname } = cmd;
+        const isCreate = oldSha === ZERO_OID;
+        const isDelete = newSha === ZERO_OID;
+
+        if (isDelete) {
+          if (!repo.refs.has(refname)) {
+            refResults.push({ refname, ok: false, reason: 'no such ref' });
+          } else {
+            repo.refs.delete(refname);
+            refResults.push({ refname, ok: true });
+          }
+          continue;
+        }
+
+        const newObj = readObject(newSha);
+        if (!newObj) {
+          refResults.push({ refname, ok: false, reason: 'missing object' });
+          continue;
+        }
+
+        if (isCreate) {
+          if (repo.refs.has(refname) && repo.refs.get(refname) !== ZERO_OID) {
+            refResults.push({ refname, ok: false, reason: 'already exists' });
+          } else if (refname.startsWith('refs/heads/') && newObj.type !== 'commit') {
+            refResults.push({ refname, ok: false, reason: 'not a commit' });
+          } else {
+            repo.refs.set(refname, newSha);
+            if (refname === `refs/heads/${repo.defaultBranch}` || repo.refs.size === 1) {
+              repo.defaultBranch = refname.startsWith('refs/heads/') ? refname.substring(11) : repo.defaultBranch;
+            }
+            refResults.push({ refname, ok: true });
+          }
+        } else {
+          // Update
+          const currentSha = repo.refs.get(refname);
+          if (currentSha !== oldSha) {
+            refResults.push({ refname, ok: false, reason: 'stale ref' });
+          } else if (newObj.type !== 'commit') {
+            refResults.push({ refname, ok: false, reason: 'not a commit' });
+          } else if (!isAncestor(oldSha, newSha)) {
+            refResults.push({ refname, ok: false, reason: 'non-fast-forward' });
+          } else {
+            repo.refs.set(refname, newSha);
+            refResults.push({ refname, ok: true });
+          }
+        }
+      }
+
+      reportLines.push(pktLine('unpack ok\n'));
+      for (const r of refResults) {
+        if (r.ok) {
+          reportLines.push(pktLine(`ok ${r.refname}\n`));
+          packCache.clear();
+        } else {
+          reportLines.push(pktLine(`ng ${r.refname} ${r.reason ?? 'failed'}\n`));
+        }
       }
     }
     reportLines.push(PKT_FLUSH);

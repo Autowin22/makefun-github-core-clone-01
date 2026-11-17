@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleRest } from './rest.ts';
 import { handleGit } from './git.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import { requestId } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -38,10 +40,32 @@ export function createApp(): Server {
       return;
     }
 
+    // MCP surface
+    if (path === '/mcp') {
+      try {
+        const handled = await handleMcp(req, res, url);
+        if (handled) return;
+      } catch (err) {
+        sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
     // REST v3 API surface
     if (path.startsWith('/api/v3')) {
       try {
         const handled = await handleRest(req, res, url);
+        if (handled) return;
+      } catch (err) {
+        sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
+    // GraphQL API surface
+    if (path === '/api/graphql' || path === '/api/v3/graphql') {
+      try {
+        const handled = await handleGraphql(req, res, url);
         if (handled) return;
       } catch (err) {
         sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });

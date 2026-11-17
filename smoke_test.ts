@@ -140,7 +140,7 @@ server.listen(0, async () => {
     console.log('[8] Testing git fetch in old clone...');
     // Make a valid new commit in cloneV0Dir or cloneDir (after pull/ff or push from another place)
     // Let's reset cloneDir to origin/main and push successfully
-    execSync(`git fetch origin && git reset --hard origin/main`, { cwd: cloneDir });
+    execSync(`git -c http.extraHeader="${authHeader}" fetch origin && git reset --hard origin/main`, { cwd: cloneDir });
     fs.writeFileSync(path.join(cloneDir, 'fetch-test.txt'), 'fetch test\n');
     execSync(`git add fetch-test.txt && git commit -m "Fetch test"`, { cwd: cloneDir });
     execSync(`git -c http.extraHeader="${authHeader}" push origin main`, { cwd: cloneDir, stdio: 'pipe' });

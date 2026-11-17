@@ -1,19 +1,19 @@
 import { createHash } from 'node:crypto';
 
 export interface GitObject {
-  type: 'blob' | 'tree' | 'commit';
+  type: 'blob' | 'tree' | 'commit' | 'tag';
   data: Buffer;
 }
 
 const objects = new Map<string, GitObject>();
 
-export function hashObject(type: 'blob' | 'tree' | 'commit', data: Buffer): string {
+export function hashObject(type: 'blob' | 'tree' | 'commit' | 'tag', data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`);
   const storeBuffer = Buffer.concat([header, data]);
   return createHash('sha1').update(storeBuffer).digest('hex');
 }
 
-export function writeObject(type: 'blob' | 'tree' | 'commit', data: Buffer): string {
+export function writeObject(type: 'blob' | 'tree' | 'commit' | 'tag', data: Buffer): string {
   const exactData = Buffer.from(data);
   const sha = hashObject(type, exactData);
   objects.set(sha, { type, data: exactData });
