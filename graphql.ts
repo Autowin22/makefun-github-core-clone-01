@@ -14,6 +14,7 @@ import {
   parseTree,
   parseCommit,
   flattenTree,
+  diffTrees,
   type Repo,
   type Issue,
   type Pull,
@@ -477,7 +478,9 @@ const SCHEMA_TYPES: Record<string, any> = {
       { __typename: '__Field', name: 'closedAt' },
       { __typename: '__Field', name: 'author' },
       { __typename: '__Field', name: 'headRefName' },
-      { __typename: '__Field', name: 'baseRefName' }
+      { __typename: '__Field', name: 'baseRefName' },
+      { __typename: '__Field', name: 'mergeable' },
+      { __typename: '__Field', name: 'files' }
     ],
   },
   Repository: {
@@ -485,6 +488,7 @@ const SCHEMA_TYPES: Record<string, any> = {
     name: 'Repository',
     fields: [
       { __typename: '__Field', name: 'id' },
+      { __typename: '__Field', name: 'databaseId' },
       { __typename: '__Field', name: 'name' },
       { __typename: '__Field', name: 'nameWithOwner' },
       { __typename: '__Field', name: 'owner' },
@@ -493,6 +497,7 @@ const SCHEMA_TYPES: Record<string, any> = {
       { __typename: '__Field', name: 'createdAt' },
       { __typename: '__Field', name: 'updatedAt' },
       { __typename: '__Field', name: 'isPrivate' },
+      { __typename: '__Field', name: 'hasIssuesEnabled' },
       { __typename: '__Field', name: 'defaultBranchRef' },
       { __typename: '__Field', name: 'issues' },
       { __typename: '__Field', name: 'issue' },
@@ -806,6 +811,26 @@ async function resolveField(
       (issue as any).__repo = repo;
       return { issue };
     }
+    if (fieldName === 'updateIssue') {
+      const id = input.id;
+      const decoded = decodeGlobalId(id);
+      if (!decoded) throw new Error('Invalid id');
+      const [repoName, numStr] = decoded.key.split('#');
+      const num = parseInt(numStr, 10);
+      const repo = Array.from(repos.values()).find(r => r.name.toLowerCase() === repoName.toLowerCase());
+      if (!repo) throw new Error('Repository not found');
+      const issue = repo.issues.find(i => i.number === num);
+      if (!issue) throw new Error('Issue not found');
+
+      if (input.state) {
+        issue.state = input.state.toLowerCase() === 'closed' ? 'closed' : 'open';
+      }
+      if (input.title !== undefined) issue.title = input.title;
+      if (input.body !== undefined) issue.body = input.body;
+      issue.updated_at = nowIso();
+      (issue as any).__repo = repo;
+      return { issue };
+    }
     if (fieldName === 'closeIssue') {
       const issueId = input.issueId;
       const decoded = decodeGlobalId(issueId);
@@ -908,6 +933,7 @@ async function resolveField(
     const ownerLogin = viewerLogin ?? 'adaiversen';
 
     if (fieldName === 'id') return encodeGlobalId('Repository', repo.name);
+    if (fieldName === 'databaseId') return repo.id;
     if (fieldName === 'name') return repo.name;
     if (fieldName === 'nameWithOwner') return `${ownerLogin}/${repo.name}`;
     if (fieldName === 'owner') return { __typename: 'User', login: ownerLogin };
@@ -916,6 +942,7 @@ async function resolveField(
     if (fieldName === 'createdAt') return nowIso();
     if (fieldName === 'updatedAt') return nowIso();
     if (fieldName === 'isPrivate') return repo.private;
+    if (fieldName === 'hasIssuesEnabled') return true;
     if (fieldName === 'viewerPermission') return 'ADMIN';
     if (fieldName === 'defaultBranchRef') {
       const defBranch = repo.defaultBranch;
@@ -1182,6 +1209,28 @@ async function resolveField(
     if (fieldName === 'author') return { __typename: 'User', login: pull.user.login };
     if (fieldName === 'headRefName') return pull.head.ref;
     if (fieldName === 'baseRefName') return pull.base.ref;
+    if (fieldName === 'mergeable') return pull.state === 'open' ? true : false;
+    if (fieldName === 'files') {
+      const baseCommitObj = readObject(pull.base.sha);
+      const headCommitObj = readObject(pull.head.sha);
+      let baseTree = '';
+      let headTree = '';
+      if (baseCommitObj && baseCommitObj.type === 'commit') {
+        baseTree = parseCommit(baseCommitObj.data).tree;
+      }
+      if (headCommitObj && headCommitObj.type === 'commit') {
+        headTree = parseCommit(headCommitObj.data).tree;
+      }
+      const diffs = diffTrees(baseTree, headTree);
+      const first = args.first ?? 100;
+      const slice = diffs.slice(0, first);
+      return {
+        totalCount: diffs.length,
+        nodes: slice,
+        edges: slice.map(d => ({ node: d })),
+        pageInfo: { hasNextPage: diffs.length > first, endCursor: null }
+      };
+    }
   }
 
   // User fields — viewer / owner / author all return { __typename: 'User', login }.

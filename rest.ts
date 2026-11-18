@@ -594,10 +594,19 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, url:
       if (issueSub === '' && method === 'GET') {
         const query = url.searchParams;
         const stateFilter = query.get('state') ?? 'open';
-        const filtered = repo.issues.filter((iss) => {
+        let filtered = repo.issues.filter((iss) => {
           if (stateFilter === 'all') return true;
           return iss.state === stateFilter;
         });
+
+        const sort = query.get('sort');
+        const direction = query.get('direction') ?? 'asc';
+        if (sort === 'created') {
+          filtered.sort((a, b) => {
+            return direction === 'desc' ? b.number - a.number : a.number - b.number;
+          });
+        }
+
         sendJson(res, 200, filtered.map(formatIssue));
         return true;
       }

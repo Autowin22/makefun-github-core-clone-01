@@ -357,7 +357,14 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, url: 
     const { method, params, id } = r;
 
     if (method === 'server/discover') {
-      results.push({ jsonrpc: "2.0", result: { supportedVersions: ["2026-07-28", "2025-11-25"] }, id });
+      results.push({
+        jsonrpc: "2.0",
+        result: {
+          supportedVersions: ["2026-07-28", "2025-11-25"],
+          serverInfo: { name: "ada-forge", version: "1.0.0" }
+        },
+        id
+      });
     } else if (method === 'initialize') {
       const version = params?.protocolVersion === "2026-07-28" ? "2026-07-28" : "2025-11-25";
       results.push({
