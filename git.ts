@@ -78,22 +78,39 @@ function parsePktLines(buf: Buffer): { line: Buffer; flush: boolean; delim: bool
   return result;
 }
 
+function peel(sha: string): string | null {
+  let currentSha = sha;
+  for (let i = 0; i < 10; i++) {
+    const obj = readObject(currentSha);
+    if (!obj) return null;
+    if (obj.type !== 'tag') return currentSha;
+    const text = obj.data.toString('utf8');
+    const match = text.match(/^object ([0-9a-f]{40})/m);
+    if (!match) return null;
+    currentSha = match[1];
+  }
+  return null;
+}
+
 // Pack generation cache
 const packCache = new Map<string, { packBuf: Buffer; shallowShas: Set<string> }>();
 
-function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], shallowDepth?: number): { packBuf: Buffer; shallowShas: Set<string> } {
-  const cacheKey = `${repo.name}:${[...wants].sort().join(',')}:${[...haves].sort().join(',')}:${shallowDepth ?? 0}`;
+function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], shallowDepth?: number, clientShallows: string[] = []): { packBuf: Buffer; shallowShas: Set<string> } {
+  const cacheKey = `${repo.name}:${[...wants].sort().join(',')}:${[...haves].sort().join(',')}:${shallowDepth ?? 0}:${clientShallows.sort().join(',')}`;
   if (packCache.has(cacheKey)) {
     return packCache.get(cacheKey)!;
   }
 
   const haveCommits = new Set<string>();
+  const clientShallowSet = new Set(clientShallows);
+
   for (const h of haves) {
     const queue = [h];
     while (queue.length > 0) {
       const cur = queue.shift()!;
       if (haveCommits.has(cur)) continue;
       haveCommits.add(cur);
+      if (clientShallowSet.has(cur)) continue;
       const obj = readObject(cur);
       if (obj && obj.type === 'commit') {
         const c = parseCommit(obj.data);
@@ -120,7 +137,6 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
     const { sha, depth } = queue.shift()!;
     if (haveCommits.has(sha)) continue;
     if (wantCommits.has(sha)) continue;
-    wantCommits.add(sha);
 
     const obj = readObject(sha);
     if (!obj || obj.type !== 'commit') continue;
@@ -129,6 +145,7 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
       shallowShas.add(sha);
       continue;
     }
+    wantCommits.add(sha);
 
     const c = parseCommit(obj.data);
     for (const p of c.parents) {
@@ -348,13 +365,10 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
     lines.push(PKT_FLUSH);
 
     const refEntries = Array.from(repo.refs.entries());
-    // Sort refs alphabetically, but ensure default branch or main/master is sorted nicely
     refEntries.sort((a, b) => a[0].localeCompare(b[0]));
 
     const defaultBranchRef = `refs/heads/${repo.defaultBranch}`;
     const defaultSha = repo.refs.get(defaultBranchRef) ?? (refEntries.length > 0 ? refEntries[0][1] : ZERO_OID);
-
-    // HEAD ref tip
     const headTip = refEntries.length > 0 ? defaultSha : ZERO_OID;
 
     if (service === 'git-upload-pack') {
@@ -365,6 +379,12 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         lines.push(pktLine(`${headTip} HEAD\0${caps}\n`));
         for (const [refName, sha] of refEntries) {
           lines.push(pktLine(`${sha} ${refName}\n`));
+          if (refName.startsWith('refs/tags/')) {
+            const peeled = peel(sha);
+            if (peeled && peeled !== sha) {
+              lines.push(pktLine(`${peeled} ${refName}^{}\n`));
+            }
+          }
         }
       }
     } else {
@@ -376,6 +396,12 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         lines.push(pktLine(`${headTip} HEAD\0${caps}\n`));
         for (const [refName, sha] of refEntries) {
           lines.push(pktLine(`${sha} ${refName}\n`));
+          if (refName.startsWith('refs/tags/')) {
+            const peeled = peel(sha);
+            if (peeled && peeled !== sha) {
+              lines.push(pktLine(`${peeled} ${refName}^{}\n`));
+            }
+          }
         }
       }
     }
@@ -440,8 +466,15 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         const defaultRef = `refs/heads/${repo.defaultBranch}`;
         const defaultSha = repo.refs.get(defaultRef);
 
-        if (wantSymrefs && defaultSha) {
-          outLines.push(pktLine(`${defaultSha} HEAD symref-target:${defaultRef}\n`));
+        const headMatches = refPrefixes.length === 0 || refPrefixes.some((p) => 'HEAD'.startsWith(p));
+        if (headMatches) {
+          if (defaultSha) {
+            let line = `${defaultSha} HEAD`;
+            if (wantSymrefs) line += ` symref-target:${defaultRef}`;
+            outLines.push(pktLine(`${line}\n`));
+          } else if (wantUnborn) {
+            outLines.push(pktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+          }
         }
 
         const refEntries = Array.from(repo.refs.entries()).sort((a, b) => a[0].localeCompare(b[0]));
@@ -450,11 +483,14 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
             const matches = refPrefixes.some((p) => refName.startsWith(p));
             if (!matches) continue;
           }
-          outLines.push(pktLine(`${sha} ${refName}\n`));
-        }
-
-        if (wantUnborn && repo.refs.size === 0) {
-          outLines.push(pktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+          let line = `${sha} ${refName}`;
+          if (wantPeel) {
+            const peeled = peel(sha);
+            if (peeled && peeled !== sha) {
+              line += ` peeled:${peeled}`;
+            }
+          }
+          outLines.push(pktLine(`${line}\n`));
         }
 
         outLines.push(PKT_FLUSH);
@@ -515,7 +551,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
           return true;
         }
 
-        const { packBuf, shallowShas } = generatePackAndShallows(repo, wants, haves, shallowDepth);
+        const { packBuf, shallowShas } = generatePackAndShallows(repo, wants, haves, shallowDepth, clientShallows);
 
         if (hasShallowArg) {
           outLines.push(pktLine('shallow-info\n'));
@@ -523,7 +559,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
             outLines.push(pktLine(`shallow ${sSha}\n`));
           }
           for (const cShallow of clientShallows) {
-            if (!shallowShas.has(cShallow)) {
+            if (!shallowShas.has(cShallow) && !haves.includes(cShallow)) {
               outLines.push(pktLine(`unshallow ${cShallow}\n`));
             }
           }
@@ -531,7 +567,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         }
 
         outLines.push(pktLine('packfile\n'));
-        const maxChunk = 65516;
+        const maxChunk = 65515;
         for (let off = 0; off < packBuf.length; off += maxChunk) {
           const chunk = packBuf.subarray(off, off + maxChunk);
           const sideChunk = Buffer.concat([Buffer.from([1]), chunk]);
@@ -548,6 +584,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
     const pktList = parsePktLines(bodyBuf);
     const wants: string[] = [];
     const haves: string[] = [];
+    const clientShallows: string[] = [];
     let shallowDepth: number | undefined = undefined;
 
     for (const p of pktList) {
@@ -560,20 +597,30 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
         haves.push(text.substring(5).trim());
       } else if (text.startsWith('deepen ')) {
         shallowDepth = parseInt(text.substring(7), 10);
+      } else if (text.startsWith('shallow ')) {
+        clientShallows.push(text.substring(8).trim());
       }
     }
 
     const outLines: Buffer[] = [];
+    const { packBuf, shallowShas } = generatePackAndShallows(repo, wants, haves, shallowDepth, clientShallows);
+
+    for (const sSha of shallowShas) {
+      outLines.push(pktLine(`shallow ${sSha}\n`));
+    }
+    for (const cSha of clientShallows) {
+      if (!shallowShas.has(cSha) && !haves.includes(cSha)) {
+        outLines.push(pktLine(`unshallow ${cSha}\n`));
+      }
+    }
+
     outLines.push(pktLine('NAK\n'));
 
-    const packBuf = generatePack(repo, wants, haves, shallowDepth);
-    const maxChunk = 65516;
+    const maxChunk = 65515;
     for (let off = 0; off < packBuf.length; off += maxChunk) {
       const chunk = packBuf.subarray(off, off + maxChunk);
       const payload = Buffer.concat([Buffer.from([1]), chunk]);
-      const len = payload.length + 4;
-      const lenHex = len.toString(16).padStart(4, '0');
-      outLines.push(Buffer.concat([Buffer.from(lenHex, 'utf8'), payload]));
+      outLines.push(pktLine(payload));
     }
     outLines.push(PKT_FLUSH);
 
@@ -839,13 +886,11 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
 
     // Frame reportBuf into sideband-64k if requested
     const respChunks: Buffer[] = [];
-    const maxChunk = 65516;
+    const maxChunk = 65515;
     for (let off = 0; off < reportBuf.length; off += maxChunk) {
       const chunk = reportBuf.subarray(off, off + maxChunk);
       const payload = Buffer.concat([Buffer.from([1]), chunk]);
-      const len = payload.length + 4;
-      const lenHex = len.toString(16).padStart(4, '0');
-      respChunks.push(Buffer.concat([Buffer.from(lenHex, 'utf8'), payload]));
+      respChunks.push(pktLine(payload));
     }
     respChunks.push(PKT_FLUSH);
 
