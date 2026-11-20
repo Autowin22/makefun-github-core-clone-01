@@ -361,6 +361,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, url: 
         jsonrpc: "2.0",
         result: {
           supportedVersions: ["2026-07-28", "2025-11-25"],
+          capabilities: { tools: {} },
           serverInfo: { name: "ada-forge", version: "1.0.0" }
         },
         id
@@ -372,7 +373,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, url: 
         result: {
           protocolVersion: version,
           capabilities: { tools: {} },
-          serverInfo: { name: "makefun-forge", version: "1.0.0" }
+          serverInfo: { name: "ada-forge", version: "1.0.0" }
         },
         id
       });

@@ -869,7 +869,7 @@ async function resolveField(
       return {
         commentEdge: {
           node: {
-            id: comment.id,
+            id: String(comment.id),
             body: comment.body,
             author: comment.user,
             createdAt: comment.created_at,
@@ -1209,7 +1209,7 @@ async function resolveField(
     if (fieldName === 'author') return { __typename: 'User', login: pull.user.login };
     if (fieldName === 'headRefName') return pull.head.ref;
     if (fieldName === 'baseRefName') return pull.base.ref;
-    if (fieldName === 'mergeable') return pull.state === 'open' ? true : false;
+    if (fieldName === 'mergeable') return pull.state === 'open' ? 'MERGEABLE' : 'UNKNOWN';
     if (fieldName === 'files') {
       const baseCommitObj = readObject(pull.base.sha);
       const headCommitObj = readObject(pull.head.sha);
@@ -1221,7 +1221,7 @@ async function resolveField(
       if (headCommitObj && headCommitObj.type === 'commit') {
         headTree = parseCommit(headCommitObj.data).tree;
       }
-      const diffs = diffTrees(baseTree, headTree);
+      const diffs = diffTrees(baseTree, headTree).map(d => ({ ...d, path: d.filename }));
       const first = args.first ?? 100;
       const slice = diffs.slice(0, first);
       return {

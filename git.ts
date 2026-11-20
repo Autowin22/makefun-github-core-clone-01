@@ -95,14 +95,15 @@ function peel(sha: string): string | null {
 // Pack generation cache
 const packCache = new Map<string, { packBuf: Buffer; shallowShas: Set<string> }>();
 
-function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], shallowDepth?: number, clientShallows: string[] = []): { packBuf: Buffer; shallowShas: Set<string> } {
+function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], shallowDepth?: number, clientShallows: string[] = []): { packBuf: Buffer; shallowShas: Set<string>; traversedShallows: Set<string> } {
   const cacheKey = `${repo.name}:${[...wants].sort().join(',')}:${[...haves].sort().join(',')}:${shallowDepth ?? 0}:${clientShallows.sort().join(',')}`;
   if (packCache.has(cacheKey)) {
-    return packCache.get(cacheKey)!;
+    return packCache.get(cacheKey)! as any;
   }
 
   const haveCommits = new Set<string>();
   const clientShallowSet = new Set(clientShallows);
+  const traversedShallows = new Set<string>();
 
   for (const h of haves) {
     const queue = [h];
@@ -130,22 +131,56 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
   }
 
   const wantCommits = new Set<string>();
+  const extraObjects = new Set<string>();
   const shallowShas = new Set<string>();
-  const queue: { sha: string; depth: number }[] = wants.map((w) => ({ sha: w, depth: 0 }));
+  const queue: { sha: string; depth: number }[] = [];
+
+  for (const w of wants) {
+    const obj = readObject(w);
+    if (!obj) continue;
+    if (obj.type !== 'commit') {
+      extraObjects.add(w);
+      if (obj.type === 'tag') {
+        const peeled = peel(w);
+        if (peeled) {
+          queue.push({ sha: peeled, depth: 0 });
+        }
+      }
+    } else {
+      queue.push({ sha: w, depth: 0 });
+    }
+  }
 
   while (queue.length > 0) {
     const { sha, depth } = queue.shift()!;
-    if (haveCommits.has(sha)) continue;
+    
+    if (haveCommits.has(sha)) {
+      if (clientShallowSet.has(sha)) {
+        if (!traversedShallows.has(sha)) {
+          traversedShallows.add(sha);
+          const obj = readObject(sha);
+          if (obj && obj.type === 'commit') {
+            const c = parseCommit(obj.data);
+            for (const p of c.parents) {
+              queue.push({ sha: p, depth: depth + 1 });
+            }
+          }
+        }
+      }
+      continue;
+    }
+
     if (wantCommits.has(sha)) continue;
 
     const obj = readObject(sha);
     if (!obj || obj.type !== 'commit') continue;
 
-    if (shallowDepth !== undefined && depth >= shallowDepth) {
+    wantCommits.add(sha);
+
+    if (shallowDepth !== undefined && depth + 1 >= shallowDepth) {
       shallowShas.add(sha);
       continue;
     }
-    wantCommits.add(sha);
 
     const c = parseCommit(obj.data);
     for (const p of c.parents) {
@@ -154,6 +189,7 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
   }
 
   const objectShas = new Set<string>();
+  for (const sha of extraObjects) objectShas.add(sha);
   for (const cSha of wantCommits) {
     objectShas.add(cSha);
     const obj = readObject(cSha);
@@ -188,7 +224,6 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
   }
 
   const packParts: Buffer[] = [];
-  // Pack header: 'PACK' (4 bytes) + version 2 (uint32be) + count (uint32be)
   const headerBuf = Buffer.alloc(12);
   headerBuf.write('PACK', 0, 4, 'ascii');
   headerBuf.writeUInt32BE(2, 4);
@@ -213,8 +248,8 @@ function generatePackAndShallows(repo: Repo, wants: string[], haves: string[], s
   const trailer = createHash('sha1').update(packWithoutTrailer).digest();
   const finalPack = Buffer.concat([packWithoutTrailer, trailer]);
 
-  const result = { packBuf: finalPack, shallowShas };
-  packCache.set(cacheKey, result);
+  const result = { packBuf: finalPack, shallowShas, traversedShallows };
+  packCache.set(cacheKey, result as any);
   return result;
 }
 
@@ -551,7 +586,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
           return true;
         }
 
-        const { packBuf, shallowShas } = generatePackAndShallows(repo, wants, haves, shallowDepth, clientShallows);
+        const { packBuf, shallowShas, traversedShallows } = generatePackAndShallows(repo, wants, haves, shallowDepth, clientShallows);
 
         if (hasShallowArg) {
           outLines.push(pktLine('shallow-info\n'));
@@ -559,7 +594,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
             outLines.push(pktLine(`shallow ${sSha}\n`));
           }
           for (const cShallow of clientShallows) {
-            if (!shallowShas.has(cShallow) && !haves.includes(cShallow)) {
+            if (!shallowShas.has(cShallow) && traversedShallows.has(cShallow)) {
               outLines.push(pktLine(`unshallow ${cShallow}\n`));
             }
           }
